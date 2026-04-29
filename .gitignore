@@ -1,0 +1,12 @@
+# Build folders
+dist/
+build/
+*.egg-info/
+
+# Python junk
+__pycache__/
+*.pyc
+
+# Environment variables (CRITICAL: Do not leak your mnemonic!)
+.env
+venv/
