@@ -123,6 +123,7 @@ class AgenizSDK:
                     "amount_micro":      amount_micro,
                     "velocity":          self._get_velocity(),
                     "timing_delta":      self._get_timing_delta(),
+                     "api_key":           self.api_key,
                 },
                 timeout=15
             )
