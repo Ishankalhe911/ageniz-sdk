@@ -1,12 +1,16 @@
 """
-Ageniz SDK — v2.0
-Matches ARC56 exactly:
-  execute_payment(uint64, address, uint64, byte[64], address)void
-Payload: b"MX" + agent(32) + recipient(32) + amount(8) + nonce(8) + b"SAFE" = 86 bytes
+Ageniz SDK — v2.1.0
+Zero-trust ML Risk Oracle and Firewall for Algorand AI Agents
 
-Security fixes in v2:
-- V1: Recipient bound to signature (bait-and-switch prevention)
-- V2: Nonce from Oracle (replay attack prevention)
+Architecture:
+- Agent calls pay() for every payment
+- Oracle scores transaction via ML (Velocity tracked strictly server-side)
+- If SAFE, smart contract executes payment to vendor via inner transaction
+- Agent pays 0.05 ALGO flat fee to Ageniz for security service
+
+Transaction group (exactly 2):
+  Txn 0: execute_payment() ABI call — contract verifies + pays vendor internally
+  Txn 1: 0.05 ALGO flat fee to Ageniz treasury
 """
 
 import os
@@ -27,7 +31,7 @@ from algosdk.transaction import PaymentTxn, OnComplete
 load_dotenv()
 
 ALGOD_URL        = "https://testnet-api.algonode.cloud"
-ORACLE_URL       = os.getenv("ORACLE_URL", "https://ageniz-oracle.onrender.com")
+ORACLE_URL       = os.getenv("ORACLE_URL", "https://ageniz-backend.onrender.com")
 APP_ID           = int(os.getenv("APP_ID", 0))
 AGENIZ_TREASURY  = "EUKRBWJBKMYRCRQOHFGEUMXGK2JDXESZ5A2W5SJVJVTF7BW5CWBSUG422Q"
 
@@ -39,9 +43,8 @@ class AgenizSDK:
         ageniz_api_key:   str   = "test_key",
         app_id:           int   = APP_ID,
         oracle_url:       str   = ORACLE_URL,
-        daily_cap_algo:   float = 5.0
+        daily_cap_algo:   float = 50.0
     ):
-        # Wallet stays local — never sent to Oracle
         self.private_key    = mnemonic.to_private_key(wallet_mnemonic)
         self.address        = account.address_from_private_key(self.private_key)
         self.signer         = AccountTransactionSigner(self.private_key)
@@ -52,7 +55,7 @@ class AgenizSDK:
         self.daily_cap_algo = daily_cap_algo
         self.algod_client   = algod.AlgodClient("", ALGOD_URL)
 
-        # Velocity tracking
+        # Velocity tracking (Purely for local UI/Demo display now)
         self._tx_count      = 0
         self._last_tx_time  = None
         self._session_start = time.time()
@@ -60,14 +63,13 @@ class AgenizSDK:
         # Reputation (in-memory)
         self.reputation_score = 0
 
-        print(f"✅ AgenizSDK v2.0 initialized")
+        print(f"✅ AgenizSDK v2.1.0 initialized")
         print(f"   Agent Address : {self.address}")
         print(f"   App ID        : {self.app_id}")
         print(f"   Oracle        : {self.oracle_url}")
         print(f"   Treasury      : {AGENIZ_TREASURY}")
 
     def opt_in(self) -> bool:
-        """Opts the agent's wallet into the Ageniz Smart Contract."""
         print(f"\n🔌 [SDK] Opting in to App ID: {self.app_id}...")
         sp = self.algod_client.suggested_params()
 
@@ -99,10 +101,6 @@ class AgenizSDK:
         amount_algo:  float,
         context:      str = ""
     ) -> dict:
-        """
-        Main method. Developer calls this for every payment.
-        Returns: SUCCESS / BLOCKED / QUARANTINE / ERROR
-        """
         amount_micro = int(amount_algo * 1_000_000)
 
         print(f"\n{'='*50}")
@@ -111,19 +109,18 @@ class AgenizSDK:
         print(f"   Amount    : {amount_algo} ALGO ({amount_micro} microALGO)")
         print(f"{'='*50}")
 
-        # ── Step 1: Call Oracle ────────────────────────────────────────
         print(f"\n🛡️  [SDK → Oracle] Requesting ML attestation...")
 
         try:
+            # V2.1.0 FIX: Only sending cryptographically necessary data. 
+            # The Oracle calculates velocity on its own server to prevent spoofing.
             oracle_res  = requests.post(
                 f"{self.oracle_url}/attest",
                 json={
                     "agent_address":     self.address,
                     "recipient_address": recipient,
                     "amount_micro":      amount_micro,
-                    "velocity":          self._get_velocity(),
-                    "timing_delta":      self._get_timing_delta(),
-                     "api_key":           self.api_key,
+                    "api_key":           self.api_key,
                 },
                 timeout=15
             )
@@ -139,7 +136,6 @@ class AgenizSDK:
         print(f"   Confidence Score : {score}")
         print(f"   Debug            : {oracle_data.get('debug')}")
 
-        # ── Step 2: Route based on verdict ────────────────────────────
         if verdict in ("BLOCKED", "ANOMALY", "INVALID"):
             reason = oracle_data.get("debug", {}).get("reason", "Anomaly detected")
             print(f"\n❌ [SDK] BLOCKED — {reason}")
@@ -147,23 +143,23 @@ class AgenizSDK:
             return {"status": "BLOCKED", "reason": reason, "score": score}
 
         if verdict == "QUARANTINE":
-            print(f"\n⚠️  [SDK] QUARANTINE — awaiting manual approval")
+            reason = oracle_data.get("debug", {}).get("reason", "Flagged for review")
+            print(f"\n⚠️  [SDK] QUARANTINE — {reason}")
             return {
                 "status":     "QUARANTINE",
-                "review_url": "https://ageniz-web3-firewall.vercel.app",
+                "reason":     reason,
+                "review_url": "https://ageniz-backend.onrender.com/quarantine",
                 "score":      score
             }
 
         if verdict != "SAFE":
             return {"status": "ERROR", "reason": f"Unknown verdict: {verdict}"}
 
-        # ── Step 3: Extract signature + nonce from Oracle response ─────
         signature_b64  = oracle_data.get("signature_b64")
-        nonce          = oracle_data.get("nonce")  # ← Oracle-generated nonce
+        nonce          = oracle_data.get("nonce")
 
         if not signature_b64:
             return {"status": "ERROR", "reason": "Oracle did not return signature"}
-
         if nonce is None:
             return {"status": "ERROR", "reason": "Oracle did not return nonce"}
 
@@ -175,32 +171,23 @@ class AgenizSDK:
                 "reason": f"Invalid signature length: {len(signature_bytes)} (expected 64)"
             }
 
-        # ── Step 4: SAFE — submit to Algorand ─────────────────────────
         print(f"\n✅ [SDK] SAFE — submitting to Algorand...")
         print(f"   Nonce : {nonce}")
 
         sp          = self.algod_client.suggested_params()
         sp.flat_fee = True
-        sp.fee      = 6000  # covers inner txn + fee txn
+        sp.fee      = 6000 
 
-        # Fee display
-        fee_tier   = self.get_fee_tier()
-        fee_micro  = int(amount_micro * fee_tier["fee_pct"] / 100)
-        net_micro  = amount_micro - fee_micro
-       # Fee display (Updated for Reality)
+        # V2.1.0 FIX: Print statements updated for Group Size 2 reality
+        fee_tier = self.get_fee_tier()
         print(f"\n💰 [SDK] Fee Breakdown:")
-        print(f"   Gross Amount : {amount_micro/1e6:.4f} ALGO")
-        print(f"   Ageniz Fee   : 0.0500 ALGO (Flat x402 Security Fee)")
-        print(f"   Net to Recip : {(amount_micro - 50000)/1e6:.4f} ALGO")
+        print(f"   Payment to vendor : {amount_algo:.4f} ALGO (via contract inner txn)")
+        print(f"   Ageniz Fee        : 0.0500 ALGO (Flat x402 Security Fee)")
+        print(f"   Total agent cost  : {amount_algo + 0.05:.4f} ALGO")
 
-        # ABI method — matches ARC56 exactly
-        # execute_payment(uint64, address, uint64, byte[64], address)void
-        # args:           amount  recipient nonce   signature  agent
         method = Method.from_signature(
             "execute_payment(uint64,address,uint64,byte[64],address)void"
         )
-
-        atc = AtomicTransactionComposer()
 
         atc = AtomicTransactionComposer()
 
@@ -212,27 +199,16 @@ class AgenizSDK:
             sp=sp,
             signer=self.signer,
             method_args=[
-                amount_micro,      # uint64  — amount
-                recipient,         # address — recipient
-                nonce,             # uint64  — one-time nonce
-                signature_bytes,   # byte[64] — Oracle signature
-                self.address       # address — agent
-            ]
+                amount_micro,      
+                recipient,         
+                nonce,             
+                signature_bytes,   
+                self.address       
+            ],
+            accounts=[recipient]  # <--- THE MAGIC FIX: Allows contract to pay the vendor
         )
 
-        # 🚨 Txn 1: THE VENDOR PAYMENT (The part that got deleted!) 🚨
-        print(f"💸 [SDK] Bundling payment to vendor...")
-        vendor_txn = PaymentTxn(
-            sender=self.address,
-            sp=sp,
-            receiver=recipient,    
-            amt=amount_micro       
-        )
-        atc.add_transaction(
-            TransactionWithSigner(txn=vendor_txn, signer=self.signer)
-        )
-
-        # 💰 Txn 2: THE TREASURY FEE
+        # Txn 1: x402 fee to Ageniz treasury
         print(f"💰 [SDK] Bundling 0.05 ALGO x402 fee to Ageniz treasury...")
         fee_txn = PaymentTxn(
             sender=self.address,
@@ -243,7 +219,6 @@ class AgenizSDK:
         atc.add_transaction(
             TransactionWithSigner(txn=fee_txn, signer=self.signer)
         )
-        
 
         try:
             result = atc.execute(self.algod_client, 4)
@@ -257,7 +232,7 @@ class AgenizSDK:
             print(f"   TxID      : {tx_id}")
             print(f"   Explorer  : https://testnet.explorer.perawallet.app/tx/{tx_id}")
             print(f"   Rep Score : {self.reputation_score}")
-            print(f"   Fee Tier  : {fee_tier['tier']} ({fee_tier['fee_pct']}%)")
+            print(f"   Fee Tier  : {fee_tier['tier']}")
 
             return {
                 "status":     "SUCCESS",
