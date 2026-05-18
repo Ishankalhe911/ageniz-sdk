@@ -1,8 +1,8 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="agenizai-sdk", # The name users will pip install
-    version="2.0.2",
+    name="agenizai-sdk",
+    version="2.1.0",
     author="Ishan Kalhe",
     author_email="ishankalhe1@gmail.com",
     description="Zero-trust ML Risk Oracle and Firewall for Algorand AI Agents",
