@@ -202,6 +202,8 @@ class AgenizSDK:
 
         atc = AtomicTransactionComposer()
 
+        atc = AtomicTransactionComposer()
+
         # Txn 0: Smart contract call
         atc.add_method_call(
             app_id=self.app_id,
@@ -212,23 +214,36 @@ class AgenizSDK:
             method_args=[
                 amount_micro,      # uint64  — amount
                 recipient,         # address — recipient
-                nonce,             # uint64  — one-time nonce (V2 fix)
+                nonce,             # uint64  — one-time nonce
                 signature_bytes,   # byte[64] — Oracle signature
-                self.address       # address — agent (V1 fix: bound to signature)
+                self.address       # address — agent
             ]
         )
 
-        # Txn 1: x402 fee to Ageniz treasury
+        # 🚨 Txn 1: THE VENDOR PAYMENT (The part that got deleted!) 🚨
+        print(f"💸 [SDK] Bundling payment to vendor...")
+        vendor_txn = PaymentTxn(
+            sender=self.address,
+            sp=sp,
+            receiver=recipient,    
+            amt=amount_micro       
+        )
+        atc.add_transaction(
+            TransactionWithSigner(txn=vendor_txn, signer=self.signer)
+        )
+
+        # 💰 Txn 2: THE TREASURY FEE
         print(f"💰 [SDK] Bundling 0.05 ALGO x402 fee to Ageniz treasury...")
         fee_txn = PaymentTxn(
             sender=self.address,
             sp=sp,
-            receiver=AGENIZ_TREASURY,  # ← treasury
-            amt=50_000                 # 0.05 ALGO flat x402 fee
+            receiver=AGENIZ_TREASURY,  
+            amt=50_000                 
         )
         atc.add_transaction(
             TransactionWithSigner(txn=fee_txn, signer=self.signer)
         )
+        
 
         try:
             result = atc.execute(self.algod_client, 4)
