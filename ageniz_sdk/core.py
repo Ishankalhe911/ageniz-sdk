@@ -1,16 +1,17 @@
 """
-Ageniz SDK — v2.1.0
+Ageniz SDK — v2.2.0
 Zero-trust ML Risk Oracle and Firewall for Algorand AI Agents
 
 Architecture:
 - Agent calls pay() for every payment
 - Oracle scores transaction via ML (Velocity tracked strictly server-side)
-- If SAFE, smart contract executes payment to vendor via inner transaction
-- Agent pays 0.05 ALGO flat fee to Ageniz for security service
+- If SAFE, Agent routes the payment through the Ageniz Smart Contract firewall
+- The contract mathematically enforces the Oracle's signature and daily limits
 
-Transaction group (exactly 2):
-  Txn 0: execute_payment() ABI call — contract verifies + pays vendor internally
-  Txn 1: 0.05 ALGO flat fee to Ageniz treasury
+Transaction group (exactly 3):
+  Txn 0: execute_payment() ABI call — contract verifies signature & enforces limits
+  Txn 1: Agent pays Vendor directly (Non-Custodial)
+  Txn 2: 0.05 ALGO flat fee to Ageniz treasury
 """
 
 import os
@@ -32,7 +33,7 @@ load_dotenv()
 
 ALGOD_URL        = "https://testnet-api.algonode.cloud"
 ORACLE_URL       = os.getenv("ORACLE_URL", "https://ageniz-backend.onrender.com")
-APP_ID           = int(os.getenv("APP_ID", 0))
+APP_ID           = int(os.getenv("APP_ID", 763708265)) # Updated to the new Router App ID
 AGENIZ_TREASURY  = "EUKRBWJBKMYRCRQOHFGEUMXGK2JDXESZ5A2W5SJVJVTF7BW5CWBSUG422Q"
 
 
@@ -63,7 +64,7 @@ class AgenizSDK:
         # Reputation (in-memory)
         self.reputation_score = 0
 
-        print(f"✅ AgenizSDK v2.1.0 initialized")
+        print(f"✅ AgenizSDK v3.0.0 initialized (Pure Router Edition)")
         print(f"   Agent Address : {self.address}")
         print(f"   App ID        : {self.app_id}")
         print(f"   Oracle        : {self.oracle_url}")
@@ -112,8 +113,6 @@ class AgenizSDK:
         print(f"\n🛡️  [SDK → Oracle] Requesting ML attestation...")
 
         try:
-            # V2.1.0 FIX: Only sending cryptographically necessary data. 
-            # The Oracle calculates velocity on its own server to prevent spoofing.
             oracle_res  = requests.post(
                 f"{self.oracle_url}/attest",
                 json={
@@ -176,12 +175,11 @@ class AgenizSDK:
 
         sp          = self.algod_client.suggested_params()
         sp.flat_fee = True
-        sp.fee      = 6000 
+        sp.fee      = 2000  # Base fee
 
-        # V2.1.0 FIX: Print statements updated for Group Size 2 reality
         fee_tier = self.get_fee_tier()
         print(f"\n💰 [SDK] Fee Breakdown:")
-        print(f"   Payment to vendor : {amount_algo:.4f} ALGO (via contract inner txn)")
+        print(f"   Payment to vendor : {amount_algo:.4f} ALGO (Agent pays directly)")
         print(f"   Ageniz Fee        : 0.0500 ALGO (Flat x402 Security Fee)")
         print(f"   Total agent cost  : {amount_algo + 0.05:.4f} ALGO")
 
@@ -191,7 +189,7 @@ class AgenizSDK:
 
         atc = AtomicTransactionComposer()
 
-        # Txn 0: Smart contract call
+        # ── Txn 0: Smart contract verification call ──
         atc.add_method_call(
             app_id=self.app_id,
             method=method,
@@ -204,11 +202,22 @@ class AgenizSDK:
                 nonce,             
                 signature_bytes,   
                 self.address       
-            ],
-            accounts=[recipient]  # <--- THE MAGIC FIX: Allows contract to pay the vendor
+            ]
         )
 
-        # Txn 1: x402 fee to Ageniz treasury
+        # ── Txn 1: Agent pays Vendor directly (Non-Custodial) ──
+        print(f"💸 [SDK] Bundling direct payment to vendor...")
+        vendor_txn = PaymentTxn(
+            sender=self.address,
+            sp=sp,
+            receiver=recipient,  
+            amt=amount_micro                 
+        )
+        atc.add_transaction(
+            TransactionWithSigner(txn=vendor_txn, signer=self.signer)
+        )
+
+        # ── Txn 2: 0.05 ALGO flat fee to Ageniz treasury ──
         print(f"💰 [SDK] Bundling 0.05 ALGO x402 fee to Ageniz treasury...")
         fee_txn = PaymentTxn(
             sender=self.address,
@@ -224,7 +233,7 @@ class AgenizSDK:
             result = atc.execute(self.algod_client, 4)
             tx_id  = result.tx_ids[0]
 
-            self._tx_count     += 1
+            self._tx_count      += 1
             self._last_tx_time  = time.time()
             self._update_reputation(+1)
 
@@ -240,7 +249,8 @@ class AgenizSDK:
                 "explorer":   f"https://testnet.explorer.perawallet.app/tx/{tx_id}",
                 "score":      score,
                 "reputation": self.reputation_score,
-                "fee_tier":   fee_tier
+                "fee_tier":   fee_tier,
+                "debug":      oracle_data.get("debug", {})  # 🚨 THE UI FIX
             }
 
         except Exception as e:
