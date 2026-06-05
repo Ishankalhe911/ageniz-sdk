@@ -171,32 +171,45 @@ class AgenizSDK:
             print(f"❌ [SDK] Oracle unreachable: {e}")
             return {"status": "ERROR", "reason": str(e)}
 
-        verdict = oracle_data.get("verdict")
-        score   = oracle_data.get("confidence_score")
+        verdict     = oracle_data.get("verdict")
+        score       = oracle_data.get("confidence_score")
+        # FIX: forward oracle debug payload so agent.py can read
+        # wallet_tier, layer_hit, reason, vendor_name, etc.
+        oracle_debug = oracle_data.get("debug") or {}
 
         print(f"   Verdict          : {verdict}")
         print(f"   Confidence Score : {score}")
-        print(f"   Debug            : {oracle_data.get('debug')}")
+        print(f"   Debug            : {oracle_debug}")
 
         # ── Step 2: Route on verdict ───────────────────────────────────
         if verdict in ("BLOCKED", "ANOMALY", "INVALID"):
-            reason = oracle_data.get("debug", {}).get("reason", "Anomaly detected")
+            reason = oracle_debug.get("reason", "Anomaly detected")
             print(f"\n❌ [SDK] BLOCKED — {reason}")
             self._update_reputation(-5)
-            return {"status": "BLOCKED", "reason": reason, "score": score}
+            return {
+                "status": "BLOCKED",
+                "reason": reason,
+                "score":  score,
+                "debug":  oracle_debug
+            }
 
         if verdict == "QUARANTINE":
-            reason = oracle_data.get("debug", {}).get("reason", "Flagged for review")
+            reason = oracle_debug.get("reason", "Flagged for review")
             print(f"\n⚠️  [SDK] QUARANTINE — {reason}")
             return {
                 "status":     "QUARANTINE",
                 "reason":     reason,
                 "review_url": f"{self.oracle_url}/quarantine",
-                "score":      score
+                "score":      score,
+                "debug":      oracle_debug
             }
 
         if verdict != "SAFE":
-            return {"status": "ERROR", "reason": f"Unknown verdict: {verdict}"}
+            return {
+                "status": "ERROR",
+                "reason": f"Unknown verdict: {verdict}",
+                "debug":  oracle_debug
+            }
 
         # ── Step 3: Unpack Oracle signature + nonce ────────────────────
         signature_b64 = oracle_data.get("signature_b64")
@@ -321,12 +334,13 @@ class AgenizSDK:
                 "explorer":   f"https://testnet.explorer.perawallet.app/tx/{tx_id}",
                 "score":      score,
                 "reputation": self.reputation_score,
-                "fee_tier":   fee_tier
+                "fee_tier":   fee_tier,
+                "debug":      oracle_debug
             }
 
         except Exception as e:
             print(f"\n❌ [SDK] Blockchain rejected: {e}")
-            return {"status": "ERROR", "reason": str(e)}
+            return {"status": "ERROR", "reason": str(e), "debug": oracle_debug}
 
     # ─────────────────────────────────────────────────────────────────
     # UI & Dashboard helpers  (local only, server-side is authoritative)
