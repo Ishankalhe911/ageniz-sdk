@@ -224,7 +224,8 @@ class AgenizSDK:
         if len(signature_bytes) != 64:
             return {
                 "status": "ERROR",
-                "reason": f"Invalid signature length: {len(signature_bytes)} (expected 64)"
+                "reason": f"Invalid signature length: {len(signature_bytes)} (expected 64)",
+                "debug": oracle_debug
             }
 
         # ── Step 4: Build 3-txn atomic group ──────────────────────────
