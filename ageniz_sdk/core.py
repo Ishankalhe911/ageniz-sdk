@@ -241,7 +241,7 @@ class AgenizSDK:
         # Txn 1 + Txn 2 (PaymentTxns): fee = 1000 µA each (standard)
         sp_abi = self.algod_client.suggested_params()
         sp_abi.flat_fee = True
-        sp_abi.fee      = 5000  # 3000 µA
+        sp_abi.fee      = 3000  # 3000 µA
 
         sp_pay = self.algod_client.suggested_params()
         sp_pay.flat_fee = True
