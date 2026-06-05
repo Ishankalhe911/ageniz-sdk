@@ -1,5 +1,5 @@
 """
-Ageniz SDK — v2.3.0
+Ageniz SDK — v2.4.0
 Zero-trust ML Risk Oracle and Firewall for Algorand AI Agents
 
 Architecture (FIREWALL MODEL — no custody):
