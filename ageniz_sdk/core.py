@@ -1,5 +1,5 @@
 """
-Ageniz SDK — v2.4.0
+Ageniz SDK — v2.5.0
 Zero-trust ML Risk Oracle and Firewall for Algorand AI Agents
 
 Architecture (FIREWALL MODEL — no custody):
@@ -10,14 +10,24 @@ Architecture (FIREWALL MODEL — no custody):
     Txn 1: Agent → Vendor              — agent pays vendor directly (no custody)
     Txn 2: Agent → Ageniz treasury     — 0.05 ALGO flat security fee
 
+Shadow Mode (observe()):
+- Agent calls observe() instead of pay()
+- Oracle runs all 4 layers identically — heuristics, ML, caps, verdict
+- Payment ALWAYS goes through regardless of verdict (simple PaymentTxn, no atomic group)
+- Everything logged to shadow_logs table with ageniz_verdict for training data
+- Developer can later add human_verdict via PATCH /shadow/{id}/verdict
+- Use this to collect real-world labelled data before enforcing the firewall
+
 Fee Strategy:
-  Txn 0 (ABI call) : fee = 3000 µA
+  pay() Txn 0 (ABI call) : fee = 3000 µA
     → 2000 µA above minimum → grants +1400 opcode budget to the group
     → Total opcode budget = 2100 (base 700×3) + 1400 (extra) = 3500
     → ed25519verify_bare costs 1900 — comfortably covered, no ensure_budget needed
-  Txn 1 (Vendor)   : fee = 1000 µA  (standard)
-  Txn 2 (Fee)      : fee = 1000 µA  (standard)
-  Total network fee : 5000 µA = 0.005 ALGO
+  pay() Txn 1 (Vendor)   : fee = 1000 µA  (standard)
+  pay() Txn 2 (Fee)      : fee = 1000 µA  (standard)
+  Total network fee pay(): 5000 µA = 0.005 ALGO
+
+  observe() Txn 0 (Vendor only): fee = 1000 µA (standard — no ABI call, no treasury fee)
 
 Security Fixes:
   V1: Recipient bound to Ed25519 signature (bait-and-switch prevention)
@@ -52,7 +62,7 @@ AGENIZ_TREASURY = "EUKRBWJBKMYRCRQOHFGEUMXGK2JDXESZ5A2W5SJVJVTF7BW5CWBSUG422Q"
 AGENIZ_FLAT_FEE_MICRO = 50_000   # 0.05 ALGO flat security fee
 ABI_TXN_FEE_MICRO     = 3_000    # Txn 0: higher fee → extra opcode budget for ed25519verify_bare
 PAY_TXN_FEE_MICRO     = 1_000    # Txn 1 + Txn 2: standard minimum
-GROUP_SIZE            = 3        # Always exactly 3 txns
+GROUP_SIZE            = 3        # Always exactly 3 txns in pay() mode
 
 
 class AgenizSDK:
@@ -83,7 +93,7 @@ class AgenizSDK:
         # In-memory reputation score
         self.reputation_score = 0
 
-        print(f"✅ AgenizSDK v3.0.0 initialized  [Firewall Model — No Custody]")
+        print(f"✅ AgenizSDK v2.4.0 initialized  [Firewall Model — No Custody]")
         print(f"   Agent Address : {self.address}")
         print(f"   App ID        : {self.app_id}")
         print(f"   Oracle        : {self.oracle_url}")
@@ -124,7 +134,7 @@ class AgenizSDK:
             return False
 
     # ─────────────────────────────────────────────────────────────────
-    # pay  — main entry point
+    # pay  — LIVE FIREWALL mode
     # ─────────────────────────────────────────────────────────────────
     def pay(
         self,
@@ -133,7 +143,7 @@ class AgenizSDK:
         context:     str = ""
     ) -> dict:
         """
-        Main method. Developer calls this for every payment.
+        LIVE FIREWALL mode. Payment blocked if Oracle returns anything other than SAFE.
 
         Builds a 3-txn atomic group ONLY if Oracle returns SAFE:
           Txn 0 — execute_payment() ABI call (contract verifies sig + updates caps)
@@ -145,14 +155,14 @@ class AgenizSDK:
         amount_micro = int(amount_algo * 1_000_000)
 
         print(f"\n{'='*55}")
-        print(f"🤖 [SDK] Payment Request")
+        print(f"🤖 [SDK] Payment Request  [LIVE MODE]")
         print(f"   Recipient : {recipient}")
         print(f"   Amount    : {amount_algo} ALGO  ({amount_micro} µALGO)")
         print(f"{'='*55}")
 
         # ── Step 1: Oracle attestation ─────────────────────────────────
         print(f"\n🛡️  [SDK → Oracle] Requesting ML attestation...")
-
+        
         try:
             # Velocity + timing_delta intentionally NOT sent here.
             # Oracle computes them server-side from Supabase to prevent SDK spoofing.
@@ -171,10 +181,8 @@ class AgenizSDK:
             print(f"❌ [SDK] Oracle unreachable: {e}")
             return {"status": "ERROR", "reason": str(e)}
 
-        verdict     = oracle_data.get("verdict")
-        score       = oracle_data.get("confidence_score")
-        # FIX: forward oracle debug payload so agent.py can read
-        # wallet_tier, layer_hit, reason, vendor_name, etc.
+        verdict      = oracle_data.get("verdict")
+        score        = oracle_data.get("confidence_score")
         oracle_debug = oracle_data.get("debug") or {}
 
         print(f"   Verdict          : {verdict}")
@@ -225,13 +233,15 @@ class AgenizSDK:
             return {
                 "status": "ERROR",
                 "reason": f"Invalid signature length: {len(signature_bytes)} (expected 64)",
-                "debug": oracle_debug
+                "debug":  oracle_debug
             }
 
         # ── Step 4: Build 3-txn atomic group ──────────────────────────
         print(f"\n✅ [SDK] SAFE — building 3-txn atomic group...")
         print(f"   Nonce : {nonce}")
 
+
+        
         # ── Fee setup ──────────────────────────────────────────────────
         # Txn 0 (ABI call): fee = 3000 µA
         #   Extra 2000 µA above minimum → AVM grants +1400 opcode budget
@@ -240,13 +250,16 @@ class AgenizSDK:
         #   Total              = 3500 — covers ed25519verify_bare (1900) + all ops
         #
         # Txn 1 + Txn 2 (PaymentTxns): fee = 1000 µA each (standard)
+
         sp_abi = self.algod_client.suggested_params()
         sp_abi.flat_fee = True
-        sp_abi.fee      = 5000  # 3000 µA
-
+        sp_abi.fee      = 5000
+        # ── Fee setup ──────────────────────────────────────────────────
+       
+        
         sp_pay = self.algod_client.suggested_params()
         sp_pay.flat_fee = True
-        sp_pay.fee      = PAY_TXN_FEE_MICRO  # 1000 µA
+        sp_pay.fee      = PAY_TXN_FEE_MICRO
 
         total_network_fee = ABI_TXN_FEE_MICRO + PAY_TXN_FEE_MICRO + PAY_TXN_FEE_MICRO
 
@@ -254,7 +267,6 @@ class AgenizSDK:
         print(f"   Gross Payment  : {amount_micro / 1e6:.6f} ALGO  → Vendor")
         print(f"   Ageniz Fee     : {AGENIZ_FLAT_FEE_MICRO / 1e6:.4f} ALGO  → Treasury")
         print(f"   Network Fees   : {total_network_fee / 1e6:.4f} ALGO  (3000 + 1000 + 1000 µA)")
-
         # ABI method signature — must match Puya contract exactly
         method = Method.from_signature(
             "execute_payment(uint64,address,uint64,byte[64],address)void"
@@ -262,33 +274,32 @@ class AgenizSDK:
 
         atc = AtomicTransactionComposer()
 
-        # ── Txn 0: ABI verification call ──────────────────────────────
-        # Contract checks: group_size==3, verifies oracle sig,
+        # ── Txn 0: ABI verification call ──────────────────────────────\
+        #contract checks: group_size==3, verifies oracle sig,
         # checks daily cap, updates state. Pure verifier — no inner txns.
         atc.add_method_call(
             app_id      = self.app_id,
             method      = method,
             sender      = self.address,
-            sp          = sp_abi,          # 3000 µA — grants extra opcode budget
+            sp          = sp_abi,
             signer      = self.signer,
             method_args = [
-                amount_micro,     # uint64   — amount in µALGO
-                recipient,        # address  — vendor wallet
-                nonce,            # uint64   — monotonic one-time nonce
-                signature_bytes,  # byte[64] — Oracle Ed25519 signature
-                self.address      # address  — agent (must match Txn.sender)
+                amount_micro,
+                recipient,
+                nonce,
+                signature_bytes,
+                self.address
             ],
-            accounts    = [recipient]      # allows contract to read vendor account
+            accounts    = [recipient]
         )
 
         # ── Txn 1: Agent → Vendor ──────────────────────────────────────
         # Contract asserts at gtxn[1]:
         #   sender   == Txn.sender  (agent)
         #   receiver == recipient   (vendor)
-        #   amount   == amount      (µALGO)
         vendor_txn = PaymentTxn(
             sender   = self.address,
-            sp       = sp_pay,             # 1000 µA
+            sp       = sp_pay,
             receiver = recipient,
             amt      = amount_micro
         )
@@ -300,11 +311,10 @@ class AgenizSDK:
         # Contract asserts at gtxn[2]:
         #   receiver == Global.creator_address
         #   amount   == 50_000
-        #   sender   == Txn.sender
         print(f"💰 [SDK] Bundling 0.05 ALGO security fee to Ageniz treasury...")
         fee_txn = PaymentTxn(
             sender   = self.address,
-            sp       = sp_pay,             # 1000 µA
+            sp       = sp_pay,
             receiver = AGENIZ_TREASURY,
             amt      = AGENIZ_FLAT_FEE_MICRO
         )
@@ -342,6 +352,147 @@ class AgenizSDK:
         except Exception as e:
             print(f"\n❌ [SDK] Blockchain rejected: {e}")
             return {"status": "ERROR", "reason": str(e), "debug": oracle_debug}
+
+    # ─────────────────────────────────────────────────────────────────
+    # observe  — SHADOW mode
+    # ─────────────────────────────────────────────────────────────────
+    def observe(
+        self,
+        recipient:    str,
+        amount_algo:  float,
+        context:      str = "",
+        scenario_tag: str | None = None
+    ) -> dict:
+        """
+        SHADOW MODE. Payment always goes through regardless of Oracle verdict.
+
+        Oracle still runs all 4 layers identically to pay() — heuristics,
+        ML scoring, spend caps — and returns a full verdict. But no atomic
+        group is built. A simple PaymentTxn executes directly.
+
+        Everything is logged to shadow_logs table in Supabase with:
+          - ageniz_verdict: what Ageniz WOULD have decided
+          - human_verdict: null initially, operator fills in later via API
+          - mode: 'shadow'
+
+        Use this to:
+          1. Collect real-world labelled training data without blocking traffic
+          2. Validate Ageniz accuracy against human ground truth
+          3. Onboard new agents in observe mode before switching to pay()
+
+        Returns dict with:
+          status:          EXECUTED (always — payment went through)
+          ageniz_verdict:  SAFE | QUARANTINE | BLOCKED (what Ageniz would have done)
+          would_have_blocked: bool
+          shadow_log_id:   UUID for submitting human verdict later
+          tx_id:           on-chain transaction ID
+        """
+        amount_micro = int(amount_algo * 1_000_000)
+
+        print(f"\n{'='*55}")
+        print(f"👁️  [SDK] Payment Request  [SHADOW MODE]")
+        print(f"   Recipient : {recipient}")
+        print(f"   Amount    : {amount_algo} ALGO  ({amount_micro} µALGO)")
+        print(f"   NOTE: Payment will execute regardless of verdict")
+        print(f"{'='*55}")
+
+        # ── Step 1: Oracle shadow attestation ──────────────────────────
+        # Hits /shadow/attest — same ML/heuristics, no signature issued
+        print(f"\n👁️  [SDK → Oracle] Requesting shadow ML scoring...")
+
+        try:
+            oracle_res  = requests.post(
+                f"{self.oracle_url}/shadow/attest",
+                json={
+                    "agent_address":     self.address,
+                    "recipient_address": recipient,
+                    "amount_micro":      amount_micro,
+                    "api_key":           self.api_key,
+                    "scenario_tag":      scenario_tag,
+                },
+                timeout=15
+            )
+            oracle_data = oracle_res.json()
+        except Exception as e:
+            print(f"❌ [SDK] Oracle unreachable: {e}")
+            return {"status": "ERROR", "reason": str(e)}
+
+        ageniz_verdict = oracle_data.get("verdict", "UNKNOWN")
+        score          = oracle_data.get("confidence_score")
+        oracle_debug   = oracle_data.get("debug") or {}
+        shadow_log_id  = oracle_data.get("shadow_log_id")  # UUID for human verdict later
+
+        would_have_blocked = ageniz_verdict in ("QUARANTINE", "BLOCKED", "ANOMALY", "INVALID")
+
+        print(f"   Ageniz Verdict   : {ageniz_verdict}  {'⚠️  (would have blocked)' if would_have_blocked else '✅ (would have passed)'}")
+        print(f"   Confidence Score : {score}")
+        print(f"   Shadow Log ID    : {shadow_log_id}")
+        print(f"   Debug            : {oracle_debug}")
+
+        # ── Step 2: Execute payment regardless ────────────────────────
+        # Simple PaymentTxn — no atomic group, no ABI call, no treasury fee
+        # Shadow mode is cheaper: only 1000 µA network fee
+        print(f"\n💸 [SDK] Executing payment (shadow mode — no firewall enforcement)...")
+
+        sp = self.algod_client.suggested_params()
+        sp.flat_fee = True
+        sp.fee      = PAY_TXN_FEE_MICRO
+
+        try:
+            txn    = PaymentTxn(
+                sender   = self.address,
+                sp       = sp,
+                receiver = recipient,
+                amt      = amount_micro
+            )
+            signed = txn.sign(self.private_key)
+            tx_id  = self.algod_client.send_transaction(signed)
+
+            # Wait for confirmation
+            from algosdk.v2client.algod import AlgodClient
+            from algosdk import transaction as algo_txn
+            algo_txn.wait_for_confirmation(self.algod_client, tx_id, 4)
+
+            self._tx_count    += 1
+            self._last_tx_time = time.time()
+
+            print(f"\n💸 [SDK] Payment executed!")
+            print(f"   TxID           : {tx_id}")
+            print(f"   Ageniz Verdict : {ageniz_verdict}  {'⚠️  WOULD HAVE BLOCKED' if would_have_blocked else '✅ would have passed'}")
+            print(f"   Explorer       : https://testnet.explorer.perawallet.app/tx/{tx_id}")
+
+            # Notify oracle of actual txn_id so shadow log is complete
+            if shadow_log_id:
+                try:
+                    requests.patch(
+                        f"{self.oracle_url}/shadow/{shadow_log_id}/txn",
+                        json={"algo_txn_id": tx_id},
+                        timeout=5
+                    )
+                except Exception:
+                    pass  # non-fatal
+
+            return {
+                "status":             "EXECUTED",
+                "ageniz_verdict":     ageniz_verdict,
+                "would_have_blocked": would_have_blocked,
+                "shadow_log_id":      shadow_log_id,
+                "tx_id":              tx_id,
+                "explorer":           f"https://testnet.explorer.perawallet.app/tx/{tx_id}",
+                "score":              score,
+                "debug":              oracle_debug
+            }
+
+        except Exception as e:
+            print(f"\n❌ [SDK] Payment failed: {e}")
+            return {
+                "status":             "ERROR",
+                "ageniz_verdict":     ageniz_verdict,
+                "would_have_blocked": would_have_blocked,
+                "shadow_log_id":      shadow_log_id,
+                "reason":             str(e),
+                "debug":              oracle_debug
+            }
 
     # ─────────────────────────────────────────────────────────────────
     # UI & Dashboard helpers  (local only, server-side is authoritative)
